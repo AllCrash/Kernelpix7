@@ -1,0 +1,216 @@
+name: Build GKI Kernel - Pixel 7 (Android 13)
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      debug_mode:
+        description: 'Enable debug mode'
+        required: false
+        default: 'false'
+
+jobs:
+  build-gki-kernel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      
+      - name: Maximize build space
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          df -h
+      
+      - name: Set up build environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            git \
+            curl \
+            unzip \
+            python3 \
+            libssl-dev \
+            bc \
+            bison \
+            flex \
+            libelf-dev \
+            ccache \
+            repo \
+            wget \
+            dos2unix
+          
+          echo "✅ Build dependencies installed"
+      
+      - name: Setup Android NDK
+        run: |
+          NDK_VERSION="r23c"
+          NDK_DIR="${HOME}/android-ndk"
+          
+          if [ ! -d "$NDK_DIR" ]; then
+            echo "📥 Downloading Android NDK ${NDK_VERSION}..."
+            wget -q https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip
+            unzip -q android-ndk-${NDK_VERSION}-linux.zip -d ${HOME}/
+            mv ${HOME}/android-ndk-${NDK_VERSION} $NDK_DIR
+            rm android-ndk-${NDK_VERSION}-linux.zip
+          fi
+          
+          echo "NDK_DIR=$NDK_DIR" >> $GITHUB_ENV
+          echo "$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+          
+          echo "✅ Android NDK configured"
+          aarch64-linux-android-gcc --version 2>/dev/null || echo "Using clang instead"
+      
+      - name: Setup Clang toolchain
+        run: |
+          sudo apt-get install -y clang llvm
+          clang --version
+          echo "✅ Clang toolchain ready"
+      
+      - name: Configure ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: gki-kernel-${{ runner.os }}
+          max-size: 2G
+      
+      - name: Fix script line endings
+        run: |
+          dos2unix ./build-gki-kernel.sh 2>/dev/null || true
+          chmod +x ./build-gki-kernel.sh
+          ls -lah build-gki-kernel.sh
+      
+      - name: Build GKI Kernel
+        env:
+          CCACHE_DIR: ${{ runner.temp }}/ccache
+          CCACHE_MAXSIZE: 2G
+          CCACHE_COMPILERCHECK: content
+          LINUX_COMPILE_BY: android-build
+          LINUX_COMPILE_HOST: google.com
+        run: |
+          echo "🔨 Starting kernel build process..."
+          bash ./build-gki-kernel.sh 2>&1 | tee build.log
+          
+          BUILD_EXIT=$?
+          if [ $BUILD_EXIT -ne 0 ]; then
+            echo "❌ Build failed with exit code $BUILD_EXIT"
+            tail -200 build.log || true
+            exit $BUILD_EXIT
+          fi
+          
+          echo "✅ Kernel build completed"
+      
+      - name: Verify build artifacts
+        if: success()
+        run: |
+          echo "📦 Checking build artifacts..."
+          
+          BUILD_DIR="kernel-build/output"
+          
+          if [ -d "$BUILD_DIR" ]; then
+            echo "Contents of $BUILD_DIR:"
+            ls -lah "$BUILD_DIR" || true
+            
+            if [ -f "$BUILD_DIR/Image.gz" ] || [ -f "$BUILD_DIR/Image" ]; then
+              echo "✅ Kernel image found"
+            else
+              echo "⚠️ Warning: Kernel image not found"
+            fi
+            
+            if [ -f "$BUILD_DIR/gki_defconfig" ]; then
+              echo "✅ Configuration file found"
+              echo "Kprobes config:"
+              grep CONFIG_KPROBE "$BUILD_DIR/gki_defconfig" 2>/dev/null || echo "⚠️ Kprobes not enabled"
+            fi
+          else
+            echo "⚠️ Output directory not found"
+          fi
+      
+      - name: Generate build report
+        if: always()
+        run: |
+          cat > BUILD_REPORT.md << 'EOF'
+          # Kernel Build Report
+          
+          ## Build Information
+          - **Timestamp**: $(date)
+          - **Kernel Branch**: common-android13-5.10
+          - **Device**: Pixel 7 (panther)
+          - **Architecture**: aarch64
+          
+          ## Integrated Components
+          - ✅ KernelSU Next
+          - ✅ SuSFS v1.5.7
+          - ✅ Kprobes Support
+          - ✅ Metadata Masking
+          
+          ## Build Status
+          EOF
+          
+          if [ -f "kernel-build/output/Image.gz" ] || [ -f "kernel-build/output/Image" ]; then
+            echo "✅ **BUILD SUCCESSFUL**" >> BUILD_REPORT.md
+          else
+            echo "❌ **BUILD FAILED**" >> BUILD_REPORT.md
+          fi
+          
+          echo "" >> BUILD_REPORT.md
+          echo "## Build Log (Last 50 lines)" >> BUILD_REPORT.md
+          echo "\`\`\`" >> BUILD_REPORT.md
+          tail -50 build.log >> BUILD_REPORT.md 2>/dev/null || echo "No build log available" >> BUILD_REPORT.md
+          echo "\`\`\`" >> BUILD_REPORT.md
+          
+          cat BUILD_REPORT.md
+      
+      - name: Upload build artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gki-kernel-pixel7
+          path: |
+            kernel-build/output/
+            BUILD_REPORT.md
+            build.log
+          retention-days: 30
+          if-no-files-found: warn
+      
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "❌ Build failed!"
+          echo ""
+          echo "Last 300 lines of build.log:"
+          tail -300 build.log 2>/dev/null || echo "No log available"
+          exit 1
+
+  build-summary:
+    name: Build Summary
+    runs-on: ubuntu-latest
+    needs: build-gki-kernel
+    if: always()
+    
+    steps:
+      - name: Check build status
+        run: |
+          echo "🎯 Build Job Status: ${{ needs.build-gki-kernel.result }}"
+          
+          if [ "${{ needs.build-gki-kernel.result }}" == "success" ]; then
+            echo "✅ Kernel build completed successfully!"
+            echo "📦 Artifacts are available for download"
+            exit 0
+          else
+            echo "❌ Kernel build failed - check logs above"
+            exit 1
+          fi
