@@ -1,0 +1,71 @@
+name: Build GKI Kernel - Pixel 7 (Android 13)
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-gki-kernel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Set up build environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git curl unzip python3 libssl-dev bc bison flex libelf-dev ccache repo wget
+          echo "✅ Dependencies installed"
+      
+      - name: Setup Android NDK
+        run: |
+          NDK_VERSION="r23c"
+          NDK_DIR="${HOME}/android-ndk"
+          if [ ! -d "$NDK_DIR" ]; then
+            wget -q https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip
+            unzip -q android-ndk-${NDK_VERSION}-linux.zip -d ${HOME}/
+            mv ${HOME}/android-ndk-${NDK_VERSION} $NDK_DIR
+          fi
+          echo "NDK_DIR=$NDK_DIR" >> $GITHUB_ENV
+          echo "$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+      
+      - name: Setup Clang
+        run: |
+          sudo apt-get install -y clang-12 llvm-12
+          sudo ln -sf /usr/bin/clang-12 /usr/bin/clang
+      
+      - name: Configure ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: gki-kernel-${{ runner.os }}
+          max-size: 2G
+      
+      - name: Make build script executable
+        run: chmod +x ./build-gki-kernel.sh
+      
+      - name: Build GKI Kernel
+        env:
+          LINUX_COMPILE_BY: android-build
+          LINUX_COMPILE_HOST: google.com
+        run: bash ./build-gki-kernel.sh 2>&1 | tee build.log
+      
+      - name: Verify artifacts
+        if: success()
+        run: |
+          ls -lah kernel-build/output/
+          grep CONFIG_KPROBE kernel-build/output/gki_defconfig
+      
+      - name: Upload artifacts
+        if: success()
+        uses: actions/upload-artifact@v3
+        with:
+          name: gki-kernel-pixel7
+          path: |
+            kernel-build/output/
+            build.log
+          retention-days: 30
