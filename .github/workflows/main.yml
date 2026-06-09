@@ -1,0 +1,42 @@
+name: Build GKI 5.10 (panther) KSU-Next + SuSFS
+
+on:
+  workflow_dispatch:        # запуск вручную из вкладки Actions
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repo (для самого скрипта)
+        uses: actions/checkout@v4
+
+      - name: Установка зависимостей сборки
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git curl unzip zip bc bison flex \
+            libssl-dev libelf-dev python3 python3-pip \
+            build-essential ccache
+          # google "repo"
+          mkdir -p "$HOME/bin"
+          curl -L https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/bin/repo"
+          chmod a+x "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          git config --global user.name  "android-build"
+          git config --global user.email "android-build@google.com"
+
+      - name: Сборка ядра
+        run: |
+          mkdir -p kernel-build && cd kernel-build
+          cp "$GITHUB_WORKSPACE/build_gki_panther.sh" .
+          chmod +x build_gki_panther.sh
+          ./build_gki_panther.sh
+
+      - name: Публикация артефактов (Image*)
+        uses: actions/upload-artifact@v4
+        with:
+          name: gki-panther-image
+          path: |
+            kernel-build/gki/out/**/dist/Image*
+          if-no-files-found: error
