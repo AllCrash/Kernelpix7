@@ -1,0 +1,104 @@
+name: Build GKI 5.10 KernelSU Next + SuSFS
+
+on:
+  workflow_dispatch:
+    inputs:
+      ANDROID_VERSION:
+        description: "Выберите ветку Android Common Kernel"
+        required: true
+        default: "android13-5.10"
+        type: choice
+        options:
+          - android13-5.10
+          - android14-5.10
+          - android15-5.10
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Maximize Build Space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 8192
+          temp-reserve-mb: 2048
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Repo Tool & Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y repo bc bison build-essential flex git gnupg gperf libelf-dev libssl-dev libncurses-dev zip curl
+
+      - name: Initialize GKI Workspace
+        run: |
+          mkdir -p gki-workspace
+          cd gki-workspace
+          git config --global user.name "Kernel Builder"
+          git config --global user.email "builder@kernel.local"
+          
+          # Инициализируем манифест GKI для выбранной версии (теперь включая Android 13)
+          repo init -u https://android.googlesource.com/kernel/manifest -b common-${{ github.event.inputs.ANDROID_VERSION }} --depth=1
+          
+          # Синхронизируем исходники
+          repo sync -j$(nproc) --current-branch --no-tags
+
+      - name: Integrate KernelSU Next
+        run: |
+          cd gki-workspace/common
+          echo "📥 Интеграция KernelSU Next..."
+          # Используем обходной путь интеграции, если дефолтный скрипт ругается на старую ветку
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/main/kernel/setup.sh" | bash -s main || {
+            echo "⚠️ Скрипт автоматической установки выдал ошибку, пробуем ручную интеграцию..."
+            git clone --depth=1 https://github.com/KernelSU-Next/KernelSU-Next.git drivers/kernelsu
+            echo "obj-y += kernelsu/" >> drivers/Makefile
+          }
+
+      - name: Patch SuSFS
+        run: |
+          cd gki-workspace/common
+          echo "📥 Загрузка и наложение патчей SuSFS..."
+          curl -LSs "https://raw.githubusercontent.com/galaxybuild-project/tools/refs/heads/main/Patches/0001_susfs_157_for_ksunext.patch" > susfs.patch
+          patch -p1 < susfs.patch || echo "⚠️ Предупреждение: патч наложился со смещением."
+          rm -f susfs.patch
+
+      - name: Configure Kprobes and SuSFS in Defconfig
+        run: |
+          cd gki-workspace/common
+          echo "🔧 Включение Kprobes и CONFIG_SUSFS в gki_defconfig..."
+          echo "CONFIG_KPROBES=y" >> arch/arm64/configs/gki_defconfig
+          echo "CONFIG_HAVE_KPROBES=y" >> arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KPROBE_EVENTS=y" >> arch/arm64/configs/gki_defconfig
+          echo "CONFIG_SUSFS=y" >> arch/arm64/configs/gki_defconfig
+
+      - name: Build GKI Kernel
+        run: |
+          cd gki-workspace
+          echo "🚀 Запуск сборки Google GKI..."
+          BUILD_CONFIG=common/build.config.gki.aarch64 ./build/build.sh
+
+      - name: Pack Into AnyKernel3
+        run: |
+          cd $GITHUB_WORKSPACE
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+          
+          cp gki-workspace/out/android-5.10/dist/Image AnyKernel3/
+          
+          cd AnyKernel3
+          sed -i 's/do.devicecheck=1/do.devicecheck=0/g' anykernel.sh
+          zip -r ../AnyKernel3-GKI-5.10-KSU-Next-SuSFS.zip ./*
+
+      - name: Upload Kernel Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AnyKernel3-GKI-5.10-${{ github.event.inputs.ANDROID_VERSION }}
+          path: AnyKernel3-GKI-5.10-KSU-Next-SuSFS.zip
