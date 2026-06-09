@@ -1,0 +1,139 @@
+name: Build GKI 5.10 (panther) KSU-Next + SuSFS
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git curl unzip zip bc bison flex libssl-dev libelf-dev \
+            python3 python3-pip build-essential ccache
+          mkdir -p "$HOME/bin"
+          curl -L https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/bin/repo"
+          chmod a+x "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          git config --global user.name  "android-build"
+          git config --global user.email "android-build@google.com"
+
+      - name: Free disk space (GKI build needs ~40+ GB)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: Build kernel
+        run: |
+          set -euo pipefail
+
+          KERNEL_BRANCH="common-android13-5.10"
+          MANIFEST_URL="https://android.googlesource.com/kernel/manifest"
+          WORKDIR="$(pwd)"
+          SRC_DIR="${WORKDIR}/gki"
+          COMMON="${SRC_DIR}/common"
+          KSU_REF="next"
+          SUSFS_BRANCH="gki-android13-5.10"
+          SUSFS_ZIP_URL="https://gitlab.com/simonpunk/susfs4ksu/-/archive/${SUSFS_BRANCH}/susfs4ksu-${SUSFS_BRANCH}.zip"
+          SUSFS_ZIP_MIRROR="https://github.com/WildKernels/susfs4ksu/archive/refs/heads/${SUSFS_BRANCH}.zip"
+          export KBUILD_BUILD_USER="android-build"
+          export KBUILD_BUILD_HOST="google.com"
+          export KBUILD_BUILD_TIMESTAMP="Thu Jan  1 00:00:00 UTC 1970"
+          export BUILD_CONFIG="common/build.config.gki.aarch64"
+          JOBS="$(nproc)"
+
+          log()  { printf '\n[+] %s\n' "$*"; }
+          warn() { printf '\n[!] %s\n' "$*"; }
+          die()  { printf '\n[x] %s\n' "$*" >&2; exit 1; }
+
+          # Неинтерактивно (--batch), но ГРОМКО падаем при .rej (--batch не лечит конфликты!).
+          apply_patch() {
+            local patch_file="$1" strip="${2:-1}"
+            [ -f "$patch_file" ] || die "Patch not found: $patch_file"
+            log "patch -p${strip} < $(basename "$patch_file")"
+            patch -p"${strip}" --batch --forward --no-backup-if-mismatch < "$patch_file" || warn "patch returned non-zero, checking .rej"
+            if find . -name '*.rej' 2>/dev/null | grep -q .; then
+              warn "Rejected hunks:"; find . -name '*.rej' -print
+              die "Patch conflict. Stop to avoid building a broken kernel."
+            fi
+          }
+
+          # 1. repo sync (depth=1)
+          log "repo init + sync: ${KERNEL_BRANCH}"
+          mkdir -p "$SRC_DIR"; cd "$SRC_DIR"
+          repo init -u "$MANIFEST_URL" -b "$KERNEL_BRANCH" --depth=1 --no-clone-bundle
+          repo sync -c -j"${JOBS}" --no-tags --no-clone-bundle --optimized-fetch --fail-fast
+          [ -d "$COMMON" ] || die "common/ missing"
+
+          # 2. KernelSU-Next (public https, no token needed)
+          log "KernelSU-Next (${KSU_REF})"
+          cd "$COMMON"
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s "$KSU_REF"
+          [ -d "${COMMON}/KernelSU-Next" ] || [ -d "${COMMON}/KernelSU" ] || die "setup.sh did not create KernelSU(-Next)"
+
+          # 3. SuSFS (curl zip of the correct branch, no git clone)
+          log "SuSFS (${SUSFS_BRANCH})"
+          cd "$WORKDIR"
+          curl -L --fail -o susfs.zip "$SUSFS_ZIP_URL" || { warn "GitLab unreachable, trying mirror"; curl -L --fail -o susfs.zip "$SUSFS_ZIP_MIRROR"; }
+          rm -rf susfs_src && mkdir susfs_src && unzip -q susfs.zip -d susfs_src
+          SUSFS_DIR="$(find "${WORKDIR}/susfs_src" -maxdepth 1 -type d -name 'susfs4ksu*' | head -n1)"
+          [ -d "${SUSFS_DIR}/kernel_patches" ] || die "kernel_patches/ absent -- wrong branch?"
+          cp -rv "${SUSFS_DIR}/kernel_patches/fs/." "${COMMON}/fs/"
+          cp -rv "${SUSFS_DIR}/kernel_patches/include/linux/." "${COMMON}/include/linux/"
+          KPATCH="$(find "${SUSFS_DIR}/kernel_patches" -maxdepth 1 -name '50_add_susfs_in_*5.10*.patch' | head -n1)"
+          [ -f "$KPATCH" ] || die "No 50_add_susfs_in_*5.10*.patch"
+          cp -v "$KPATCH" "${COMMON}/"
+          cd "$COMMON"
+          apply_patch "${COMMON}/$(basename "$KPATCH")" 1
+          KSU_PATH="${COMMON}/KernelSU-Next"; [ -d "$KSU_PATH" ] || KSU_PATH="${COMMON}/KernelSU"
+          KSUPATCH="${SUSFS_DIR}/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
+          if [ -f "$KSUPATCH" ]; then cp -v "$KSUPATCH" "${KSU_PATH}/"; cd "$KSU_PATH"; apply_patch "${KSU_PATH}/10_enable_susfs_for_ksu.patch" 1; else warn "10_enable_susfs_for_ksu.patch absent -- KSU-Next may already be susfs-aware"; fi
+
+          # 4. defconfig / KMI / mkcompile_h  (AFTER patches)
+          log "defconfig / KMI / mkcompile_h"
+          DEFCONFIG="${COMMON}/arch/arm64/configs/gki_defconfig"
+          [ -f "$DEFCONFIG" ] || die "gki_defconfig not found"
+          {
+            echo 'CONFIG_KSU=y'
+            echo 'CONFIG_KSU_SUSFS=y'
+            echo 'CONFIG_KSU_SUSFS_SUS_PATH=y'
+            echo 'CONFIG_KSU_SUSFS_SUS_MOUNT=y'
+            echo 'CONFIG_KSU_SUSFS_SUS_KSTAT=y'
+            echo 'CONFIG_KSU_SUSFS_TRY_UMOUNT=y'
+            echo 'CONFIG_KSU_SUSFS_SPOOF_UNAME=y'
+            echo 'CONFIG_KSU_SUSFS_ENABLE_LOG=y'
+            echo 'CONFIG_KPROBES=y'
+            echo 'CONFIG_KPROBE_EVENTS=y'
+            echo 'CONFIG_KALLSYMS=y'
+            echo 'CONFIG_KALLSYMS_ALL=y'
+            echo 'CONFIG_FTRACE=y'
+            echo 'CONFIG_DYNAMIC_FTRACE=y'
+          } >> "$DEFCONFIG"
+          BC="${COMMON}/build.config.gki.aarch64"
+          [ -f "$BC" ] || die "build.config.gki.aarch64 not found"
+          sed -i 's/check_defconfig//g' "$BC"
+          { echo 'POST_DEFCONFIG_CMDS="true"'; echo 'TRIM_NONLISTED_KMI=""'; echo 'KMI_SYMBOL_LIST_STRICT_MODE=""'; } >> "$BC"
+          MK="${COMMON}/scripts/mkcompile_h"
+          if [ -f "$MK" ]; then
+            sed -i -e 's/^[[:space:]]*LINUX_COMPILE_BY=.*/LINUX_COMPILE_BY="android-build"/' -e 's/^[[:space:]]*LINUX_COMPILE_HOST=.*/LINUX_COMPILE_HOST="google.com"/' "$MK" || warn "mkcompile_h sed failed -- relying on KBUILD_* env"
+          fi
+
+          # 5. build
+          log "build/build.sh -j${JOBS}"
+          cd "$SRC_DIR"
+          LTO=thin BUILD_CONFIG="$BUILD_CONFIG" build/build.sh -j"${JOBS}"
+          log "Artifacts:"
+          find "${SRC_DIR}/out" -maxdepth 5 -name 'Image*' -print 2>/dev/null || true
+
+      - name: Upload artifacts (Image*)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gki-panther-image
+          path: |
+            gki/out/**/dist/Image*
+          if-no-files-found: warn
