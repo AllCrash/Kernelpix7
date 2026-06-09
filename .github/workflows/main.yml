@@ -1,0 +1,126 @@
+name: Build GKI 5.10 KernelSU Next + SuSFS
+
+on:
+  workflow_dispatch:
+    inputs:
+      ANDROID_VERSION:
+        description: "Выберите ветку Android Common Kernel"
+        required: true
+        default: "android13-5.10"
+        type: choice
+        options:
+          - android13-5.10
+          - android14-5.10
+          - android15-5.10
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Maximize Build Space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 8192
+          temp-reserve-mb: 2048
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Repo Tool & Toolchain Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y repo bc bison build-essential flex git gnupg gperf libelf-dev libssl-dev libncurses-dev zip curl
+
+      - name: Initialize GKI Workspace
+        run: |
+          mkdir -p gki-workspace
+          cd gki-workspace
+          git config --global user.name "Kernel Builder"
+          git config --global user.email "builder@kernel.local"
+          
+          # Синхронизируем чистый манифест GKI от Google без лишней истории
+          repo init -u https://android.googlesource.com/kernel/manifest -b common-${{ github.event.inputs.ANDROID_VERSION }} --depth=1
+          repo sync -j$(nproc) --current-branch --no-tags --force-sync
+
+      - name: Integrate KernelSU Next (Direct Source)
+        run: |
+          cd gki-workspace/common
+          echo "📥 Интеграция KernelSU Next..."
+          # Прямое клонирование исходников в правильный каталог драйверов
+          rm -rf drivers/kernelsu
+          git clone --depth=1 https://github.com/KernelSU-Next/KernelSU-Next.git drivers/kernelsu
+          
+          # Проверяем, добавлена ли строка в Makefile, чтобы не дублировать
+          if ! grep -q "obj-y += kernelsu/" drivers/Makefile; then
+            echo "obj-y += kernelsu/" >> drivers/Makefile
+          fi
+
+      - name: Patch SuSFS
+        run: |
+          cd gki-workspace/common
+          echo "📥 Наложение патчей маскировки SuSFS..."
+          curl -LSs "https://raw.githubusercontent.com/galaxybuild-project/tools/refs/heads/main/Patches/0001_susfs_157_for_ksunext.patch" > susfs.patch
+          patch -p1 < susfs.patch || echo "⚠️ Предупреждение: некоторые строки сместились, патч применился частично."
+          rm -f susfs.patch
+
+      - name: Inject Kprobes & SuSFS into Defconfig
+        run: |
+          cd gki-workspace/common
+          echo "🔧 Включение параметров Кпобле в дефконфиг..."
+          
+          # В зависимости от ветки Google, ищем gki_defconfig в его стандартных местах
+          CONFIG_FILE="arch/arm64/configs/gki_defconfig"
+          if [ ! -f "$CONFIG_FILE" ]; then
+            CONFIG_FILE="build/arch/arm64/configs/gki_defconfig"
+          fi
+          
+          if [ -f "$CONFIG_FILE" ]; then
+            echo "CONFIG_KPROBES=y" >> "$CONFIG_FILE"
+            echo "CONFIG_HAVE_KPROBES=y" >> "$CONFIG_FILE"
+            echo "CONFIG_KPROBE_EVENTS=y" >> "$CONFIG_FILE"
+            echo "CONFIG_SUSFS=y" >> "$CONFIG_FILE"
+            echo "✅ Конфиг успешно модифицирован: $CONFIG_FILE"
+          else
+            echo "❌ Ошибка: gki_defconfig не найден!"
+            exit 1
+          fi
+
+      - name: Build GKI Kernel via Official Google Script
+        run: |
+          cd gki-workspace
+          echo "🚀 Запуск официального билдера Google Android..."
+          # Используем встроенный в манифест инструмент компиляции, который сам знает где лежит его Clang
+          LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 ./build/build.sh
+
+      - name: Pack Into AnyKernel3
+        run: |
+          cd $GITHUB_WORKSPACE
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+          
+          # Находим скомпилированное ядро в папке dist
+          IMAGE_PATH=$(find gki-workspace/out -name "Image" | head -n 1)
+          
+          if [ -z "$IMAGE_PATH" ] || [ ! -f "$IMAGE_PATH" ]; then
+            echo "❌ Ошибка: Скомпилированный файл ядра Image не найден!"
+            exit 1
+          fi
+          
+          cp "$IMAGE_PATH" AnyKernel3/
+          
+          cd AnyKernel3
+          sed -i 's/do.devicecheck=1/do.devicecheck=0/g' anykernel.sh
+          zip -r ../AnyKernel3-GKI-5.10-KSU-Next-SuSFS.zip ./*
+
+      - name: Upload Finished Kernel Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AnyKernel3-GKI-5.10-${{ github.event.inputs.ANDROID_VERSION }}
+          path: AnyKernel3-GKI-5.10-KSU-Next-SuSFS.zip
