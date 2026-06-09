@@ -1,0 +1,55 @@
+name: Build GKI 5.10 (panther) KSU-Next + SuSFS
+
+on:
+  workflow_dispatch:        # запуск вручную из вкладки Actions
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repo (вместе со скриптом сборки)
+        uses: actions/checkout@v4
+
+      - name: Установка зависимостей сборки
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git curl unzip zip bc bison flex \
+            libssl-dev libelf-dev python3 python3-pip \
+            build-essential ccache
+          # google "repo"
+          mkdir -p "$HOME/bin"
+          curl -L https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/bin/repo"
+          chmod a+x "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          git config --global user.name  "android-build"
+          git config --global user.email "android-build@google.com"
+
+      - name: Освободить место на диске (GKI-сборке нужно ~40+ ГБ)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: Сборка ядра
+        run: |
+          # Скрипт мог быть закоммичен в корень или в подкаталог — ищем его.
+          SCRIPT="$(find "$GITHUB_WORKSPACE" -maxdepth 3 -name build_gki_panther.sh | head -n1)"
+          if [ -z "$SCRIPT" ]; then
+            echo "::error::build_gki_panther.sh не найден в репозитории AllCrash/Kernelpix7."
+            echo "Закоммить файл build_gki_panther.sh в репо (например, в корень) и перезапусти."
+            exit 1
+          fi
+          echo "Использую скрипт: $SCRIPT"
+          mkdir -p kernel-build && cd kernel-build
+          bash "$SCRIPT"
+
+      - name: Публикация артефактов (Image*)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gki-panther-image
+          path: |
+            kernel-build/gki/out/**/dist/Image*
+          if-no-files-found: warn
